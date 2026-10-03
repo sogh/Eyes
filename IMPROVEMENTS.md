@@ -4,9 +4,11 @@ Review of the codebase (single `index.html` + `js/ui/*` modules + 19 JSON script
 
 ## Bugs
 
+All seven are fixed on branch `fix/bug-batch`.
+
 1. **Browser shortcuts hijacked** — the main keydown handler ignores modifiers and calls `preventDefault()`, so Ctrl+R (reload) narrows the gap, Ctrl+P (print) plays a script, Ctrl+D toggles the director, Ctrl+W/Q change scale. Bail out when `ctrlKey`/`metaKey`/`altKey` is held.
 2. **Shortcuts fire while typing** — the main handler doesn't skip focused inputs, so typing in test-mode/debug-panel fields triggers eye actions.
-3. **Most toasts never fire** — `initializeUIModules` wraps `window.toggleSpiderMode`, `window.setEyeBehavior`, `window.executeScript`, `window.completeScript`, but the keyboard handler, director and script engine call the local functions directly. Only `D` works. `window.isSpiderModeActive` is also a stale snapshot.
+3. **Fragile toast wiring / stale globals** — `initializeUIModules` showed toasts by monkey-patching `window.toggleSpiderMode`, `window.setEyeBehavior`, `window.executeScript`, `window.completeScript`. (This did work: top-level functions in a classic script are `window` properties, so the patch replaced what callers resolved — the original review wrongly said toasts never fired.) The real defects: the patching was fragile, `window.isSpiderModeActive` was a stale snapshot, and `window.activeSetIndex` (read by the debug panel) was never exposed.
 4. **Director cooldown not enforced within an evaluation** — `lastScriptTime` is set inside the per-set loop but only checked before it, so several sets can start scripts in the same tick.
 5. **Interaction scripts leak** — stopping/completing a script doesn't stop its `interactionInstances`. Interactions also target hardcoded set indices and silently no-op if those sets aren't visible.
 6. **Persistence edge cases** — reloading mid-script can persist the scripted position/scale/gap instead of the originals; restored values aren't validated (`NaN` transforms possible); eyes moved off-screen can't be recovered without clearing storage (no reset key).
