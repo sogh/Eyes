@@ -728,6 +728,14 @@
         const spiderEyeTrackingMaxDistance = 25; // Maximum distance iris moves when tracking
         const spiderEyeTrackingDistanceDivisor = 30; // Divisor for tracking distance calculation
 
+        // Eyelid (eye-white ry) animation constants
+        const eyeOpenRy = 55; // ry of .eye-white / .eye-white-clip when fully open
+        const eyeClosedRy = 5.5; // ry when closed (blink)
+        const eyeSquintRy = 27.5; // ry when squinting
+        const eyeBlinkCloseMs = 100; // Blink close duration (also the hold before reopening)
+        const eyeBlinkOpenMs = 100; // Blink reopen duration
+        const eyeSquintTransitionMs = 100; // Squint close/reopen duration
+
         // Drip animation constants
         const dripPoolSize = 30; // Number of reusable drip elements
         const maxSimultaneousDrips = 15; // Maximum drips active at once
@@ -2765,138 +2773,116 @@
             }
         }
 
+        // Cancel any in-flight eyelid (ry) animation and pending blink reopen for an eye set
+        function cancelEyeLidAnimation(eyeSet) {
+            if (eyeSet.lidAnimId) {
+                cancelAnimationFrame(eyeSet.lidAnimId);
+                eyeSet.lidAnimId = null;
+            }
+            if (eyeSet.lidTimeoutId) {
+                clearTimeout(eyeSet.lidTimeoutId);
+                eyeSet.lidTimeoutId = null;
+            }
+        }
+
+        // Animate the eye-white and clip-mask ellipses of a set from their current ry to targetRy.
+        // Only one lid animation runs per set: starting a new one cancels any in-flight one.
+        function animateEyeRy(setIndex, targetRy, durationMs) {
+            const eyeSet = eyeSets[setIndex];
+            if (!eyeSet) return;
+
+            if (eyeSet.lidAnimId) {
+                cancelAnimationFrame(eyeSet.lidAnimId);
+                eyeSet.lidAnimId = null;
+            }
+
+            const eyeWhites = eyeSet.element.querySelectorAll('.eye-white');
+            const clipEllipses = eyeSet.element.querySelectorAll('.eye-white-clip');
+
+            // Start from current ry values (in case a previous animation was interrupted)
+            const startWhiteRy = eyeWhites.length > 0 ? parseFloat(eyeWhites[0].getAttribute('ry')) || eyeOpenRy : eyeOpenRy;
+            const startClipRy = clipEllipses.length > 0 ? parseFloat(clipEllipses[0].getAttribute('ry')) || eyeOpenRy : eyeOpenRy;
+
+            const startTime = performance.now();
+            function step(currentTime) {
+                const elapsed = currentTime - startTime;
+                const progress = durationMs > 0 ? Math.min(Math.max(elapsed / durationMs, 0), 1) : 1;
+                const whiteRy = progress >= 1 ? targetRy : startWhiteRy + (targetRy - startWhiteRy) * progress;
+                const clipRy = progress >= 1 ? targetRy : startClipRy + (targetRy - startClipRy) * progress;
+
+                eyeWhites.forEach(ellipse => {
+                    ellipse.setAttribute('ry', whiteRy.toString());
+                });
+                clipEllipses.forEach(ellipse => {
+                    ellipse.setAttribute('ry', clipRy.toString());
+                });
+
+                eyeSet.lidAnimId = progress < 1 ? requestAnimationFrame(step) : null;
+            }
+            eyeSet.lidAnimId = requestAnimationFrame(step);
+        }
+
+        // Immediately restore an eye set's lids to fully open, cancelling any lid animation or squint
+        function resetEyeLids(eyeSet) {
+            cancelEyeLidAnimation(eyeSet);
+            if (eyeSet.squintTimeoutId) {
+                clearTimeout(eyeSet.squintTimeoutId);
+                eyeSet.squintTimeoutId = null;
+            }
+            eyeSet.lidRestRy = eyeOpenRy;
+            if (!eyeSet.element) return;
+            eyeSet.element.querySelectorAll('.eye-white, .eye-white-clip').forEach(ellipse => {
+                ellipse.setAttribute('ry', eyeOpenRy.toString());
+            });
+        }
+
         // Per-set blinking function
         function blinkEyeSet(setIndex) {
             const eyeSet = eyeSets[setIndex];
             if (!eyeSet || !eyeSet.visible) return;
 
-            const eyeWhites = eyeSet.element.querySelectorAll('.eye-white');
-            const clipEllipses = eyeSet.element.querySelectorAll('.eye-white-clip');
-
-            // Get current ry values (in case animation is in progress)
-            const currentWhiteRy = eyeWhites.length > 0 ? parseFloat(eyeWhites[0].getAttribute('ry')) || 55 : 55;
-            const currentClipRy = clipEllipses.length > 0 ? parseFloat(clipEllipses[0].getAttribute('ry')) || 55 : 55;
-
-            // Animate eye-white and clipPath closing over 100ms
-            const closeStartTime = performance.now();
-            function animateClose(currentTime) {
-                const elapsed = currentTime - closeStartTime;
-                const progress = Math.min(elapsed / 100, 1);
-                const whiteRy = Math.max(5.5, currentWhiteRy - (currentWhiteRy - 5.5) * progress);
-                const clipRy = Math.max(5.5, currentClipRy - (currentClipRy - 5.5) * progress);
-
-                eyeWhites.forEach(ellipse => {
-                    ellipse.setAttribute('ry', whiteRy.toString());
-                });
-                clipEllipses.forEach(ellipse => {
-                    ellipse.setAttribute('ry', clipRy.toString());
-                });
-
-                if (progress < 1) {
-                    requestAnimationFrame(animateClose);
-                }
-            }
-            requestAnimationFrame(animateClose);
-
-            // Animate back to normal after 100ms (blink duration)
-            setTimeout(() => {
-                // Get current ry values when opening starts
-                const currentWhiteOpen = eyeWhites.length > 0 ? parseFloat(eyeWhites[0].getAttribute('ry')) || 5.5 : 5.5;
-                const currentClipOpen = clipEllipses.length > 0 ? parseFloat(clipEllipses[0].getAttribute('ry')) || 5.5 : 5.5;
-
-                // Animate eye-white and clipPath back to normal over 100ms
-                const openStartTime = performance.now();
-                function animateOpen(currentTime) {
-                    const elapsed = currentTime - openStartTime;
-                    const progress = Math.min(elapsed / 100, 1);
-                    const whiteRy = Math.min(55, currentWhiteOpen + (55 - currentWhiteOpen) * progress);
-                    const clipRy = Math.min(55, currentClipOpen + (55 - currentClipOpen) * progress);
-
-                    eyeWhites.forEach(ellipse => {
-                        ellipse.setAttribute('ry', whiteRy.toString());
-                    });
-                    clipEllipses.forEach(ellipse => {
-                        ellipse.setAttribute('ry', clipRy.toString());
-                    });
-
-                    if (progress < 1) {
-                        requestAnimationFrame(animateOpen);
-                    }
-                }
-                requestAnimationFrame(animateOpen);
-            }, 100);
+            // Cancel any in-flight lid animation / pending reopen, then close -> hold -> open.
+            // Reopen to the resting ry (fully open, or squinted if a squint is being held).
+            cancelEyeLidAnimation(eyeSet);
+            animateEyeRy(setIndex, eyeClosedRy, eyeBlinkCloseMs);
+            eyeSet.lidTimeoutId = setTimeout(() => {
+                eyeSet.lidTimeoutId = null;
+                animateEyeRy(setIndex, eyeSet.lidRestRy ?? eyeOpenRy, eyeBlinkOpenMs);
+            }, eyeBlinkCloseMs);
 
             // Only schedule next blink if still in AUTONOMOUS mode
             if (eyeSet.behavior === BehaviorType.AUTONOMOUS) {
+                if (eyeSet.blinkTimeoutId) clearTimeout(eyeSet.blinkTimeoutId); // avoid duplicate blink chains
                 const nextBlinkDelay = Math.random() * 16000 + 4000; // 4000ms to 20000ms
                 eyeSet.blinkTimeoutId = setTimeout(() => blinkEyeSet(setIndex), nextBlinkDelay);
             }
         }
 
-        // Per-set squinting function
+        // Per-set squinting function (duration in seconds; <= 0 holds the squint until reset)
         function squintEyeSet(setIndex, duration) {
             const eyeSet = eyeSets[setIndex];
             if (!eyeSet || !eyeSet.visible) return;
 
-            const eyeWhites = eyeSet.element.querySelectorAll('.eye-white');
-            const clipEllipses = eyeSet.element.querySelectorAll('.eye-white-clip');
-
-            // Get current ry values (in case animation is in progress)
-            const currentWhiteRy = eyeWhites.length > 0 ? parseFloat(eyeWhites[0].getAttribute('ry')) || 55 : 55;
-            const currentClipRy = clipEllipses.length > 0 ? parseFloat(clipEllipses[0].getAttribute('ry')) || 55 : 55;
-
-            // Animate eye-white and clipPath closing over 100ms
-            const closeStartTime = performance.now();
-            function animateClose(currentTime) {
-                const elapsed = currentTime - closeStartTime;
-                const progress = Math.min(elapsed / 100, 1);
-                const whiteRy = Math.max(27.5, currentWhiteRy - (currentWhiteRy - 27.5) * progress);
-                const clipRy = Math.max(27.5, currentClipRy - (currentClipRy - 27.5) * progress);
-
-                eyeWhites.forEach(ellipse => {
-                    ellipse.setAttribute('ry', whiteRy.toString());
-                });
-                clipEllipses.forEach(ellipse => {
-                    ellipse.setAttribute('ry', clipRy.toString());
-                });
-
-                if (progress < 1) {
-                    requestAnimationFrame(animateClose);
-                }
+            // A squint supersedes any in-flight blink or previous squint
+            cancelEyeLidAnimation(eyeSet);
+            if (eyeSet.squintTimeoutId) {
+                clearTimeout(eyeSet.squintTimeoutId);
+                eyeSet.squintTimeoutId = null;
             }
-            requestAnimationFrame(animateClose);
+
+            eyeSet.lidRestRy = eyeSquintRy;
+            animateEyeRy(setIndex, eyeSquintRy, eyeSquintTransitionMs);
 
             if (duration <= 0) {
                 return;
             }
             // Animate back to normal after squint duration
-            setTimeout(() => {
-                // Get current ry values when opening starts
-                const currentWhiteOpen = eyeWhites.length > 0 ? parseFloat(eyeWhites[0].getAttribute('ry')) || 27.5 : 27.5;
-                const currentClipOpen = clipEllipses.length > 0 ? parseFloat(clipEllipses[0].getAttribute('ry')) || 27.5 : 27.5;
-
-                // Animate eye-white and clipPath back to normal over 100ms
-                const openStartTime = performance.now();
-                function animateOpen(currentTime) {
-                    const elapsed = currentTime - openStartTime;
-                    const progress = Math.min(elapsed / 100, 1);
-                    const whiteRy = Math.min(55, currentWhiteOpen + (55 - currentWhiteOpen) * progress);
-                    const clipRy = Math.min(55, currentClipOpen + (55 - currentClipOpen) * progress);
-
-                    eyeWhites.forEach(ellipse => {
-                        ellipse.setAttribute('ry', whiteRy.toString());
-                    });
-                    clipEllipses.forEach(ellipse => {
-                        ellipse.setAttribute('ry', clipRy.toString());
-                    });
-
-                    if (progress < 1) {
-                        requestAnimationFrame(animateOpen);
-                    }
-                }
-                requestAnimationFrame(animateOpen);
+            eyeSet.squintTimeoutId = setTimeout(() => {
+                eyeSet.squintTimeoutId = null;
+                eyeSet.lidRestRy = eyeOpenRy;
+                cancelEyeLidAnimation(eyeSet);
+                animateEyeRy(setIndex, eyeOpenRy, eyeSquintTransitionMs);
             }, duration * 1000);
-
         }
 
         // Per-set iris movement function
@@ -3076,6 +3062,9 @@
         function stopEyeSetAnimations(setIndex) {
             const eyeSet = eyeSets[setIndex];
             if (!eyeSet) return;
+
+            // Cancel in-flight blink/squint lid animations and leave the eyes fully open
+            resetEyeLids(eyeSet);
 
             // Clear timeout timers
             if (eyeSet.blinkTimeoutId) {
