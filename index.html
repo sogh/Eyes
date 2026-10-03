@@ -353,6 +353,7 @@
         <p><kbd>E/R</kbd> Gap wider/closer</p>
         <p><kbd>J</kbd> Cycle eyebrow style</p>
         <p><kbd>↑↓←→</kbd> Move position</p>
+        <p><kbd>Backspace</kbd> Reset position/scale/gap</p>
         <p><kbd>Space</kbd> Help</p>
     </div>
 
@@ -3203,11 +3204,14 @@
                 for (let i = 0; i < maxSets; i++) {
                     const eyeSet = eyeSets[i];
                     if (eyeSet) {
+                        // Mid-script, persist the pre-script transform rather than the scripted one
+                        const orig = eyeSet.currentScript && eyeSet.currentScript.originalState;
+                        const src = orig || eyeSet;
                         state.eyeSets[i] = {
-                            scale: eyeSet.scale,
-                            gap: eyeSet.gap,
-                            posX: eyeSet.posX,
-                            posY: eyeSet.posY,
+                            scale: src.scale,
+                            gap: src.gap,
+                            posX: src.posX,
+                            posY: src.posY,
                             visible: eyeSet.visible,
                             everShown: eyeSet.everShown,
                             behavior: eyeSet.behavior || BehaviorType.AUTONOMOUS,
@@ -3251,7 +3255,20 @@
             }
         }
 
+        // Sanitize a restored numeric value: finite number (optionally clamped) or fallback
+        function sanitizeNumber(value, fallback, min = -Infinity, max = Infinity) {
+            return (typeof value === 'number' && Number.isFinite(value))
+                ? Math.max(min, Math.min(value, max))
+                : fallback;
+        }
+
         document.addEventListener('keydown', (event) => {
+            // Leave browser/OS shortcuts (Ctrl+R, Cmd+P, Alt+D, ...) alone
+            if (event.ctrlKey || event.metaKey || event.altKey) return;
+            // Don't hijack keys while typing in form fields
+            if (event.target && event.target.matches &&
+                event.target.matches('input, select, textarea, [contenteditable]:not([contenteditable="false"])')) return;
+
             const key = event.key.toLowerCase();
 
             // Spacebar to toggle instructions
@@ -3429,6 +3446,19 @@
             // Control keys only work if there's an active set
             if (activeSetIndex === -1) return;
             const eyeSet = eyeSets[activeSetIndex];
+            if (!eyeSet) return;
+
+            // Backspace/Delete - reset active set position, scale and gap
+            if (event.key === 'Backspace' || event.key === 'Delete') {
+                event.preventDefault();
+                eyeSet.posX = 0;
+                eyeSet.posY = 0;
+                eyeSet.scale = defaultState.scale;
+                eyeSet.gap = defaultState.gap;
+                updateEyeSetTransform(activeSetIndex);
+                debouncedSaveState();
+                return;
+            }
 
             // Q/W for scale (up/down)
             if (key === 'q') {
@@ -3619,14 +3649,17 @@
                         // Create or get the eye set
                         const eyeSet = getOrCreateEyeSet(i);
 
-                        // Restore saved properties
-                        eyeSet.scale = savedSet.scale;
-                        eyeSet.gap = savedSet.gap;
-                        eyeSet.posX = savedSet.posX;
-                        eyeSet.posY = savedSet.posY;
-                        eyeSet.visible = savedSet.visible;
-                        eyeSet.everShown = savedSet.everShown;
-                        eyeSet.behavior = savedSet.behavior || BehaviorType.AUTONOMOUS;
+                        // Restore saved properties (validated; off-screen positions reset to center)
+                        eyeSet.scale = sanitizeNumber(savedSet.scale, defaultState.scale, minScale, maxScale);
+                        eyeSet.gap = sanitizeNumber(savedSet.gap, defaultState.gap, minGap, maxGap);
+                        eyeSet.posX = sanitizeNumber(savedSet.posX, defaultState.posX);
+                        eyeSet.posY = sanitizeNumber(savedSet.posY, defaultState.posY);
+                        if (Math.abs(eyeSet.posX) > window.innerWidth) eyeSet.posX = 0;
+                        if (Math.abs(eyeSet.posY) > window.innerHeight) eyeSet.posY = 0;
+                        eyeSet.visible = savedSet.visible === true;
+                        eyeSet.everShown = savedSet.everShown === true;
+                        eyeSet.behavior = Object.values(BehaviorType).includes(savedSet.behavior)
+                            ? savedSet.behavior : BehaviorType.AUTONOMOUS;
                         eyeSet.browStyle = savedSet.browStyle || 'medium';
                         eyeSet.browAngle = savedSet.browAngle || 0;
                         eyeSet.browHeight = savedSet.browHeight || 0;
@@ -3680,7 +3713,8 @@
                 }
 
                 // Restore active set index
-                activeSetIndex = savedState.activeSetIndex;
+                const savedActive = savedState.activeSetIndex;
+                activeSetIndex = (Number.isInteger(savedActive) && eyeSets[savedActive]) ? savedActive : -1;
 
                 // Restore drip toggle state (default to true if not present)
                 dripsEnabled = savedState.dripsEnabled !== undefined ? savedState.dripsEnabled : true;
@@ -3803,7 +3837,8 @@
                 // Add keyboard shortcut to cycle notification presets
                 document.addEventListener('keydown', (event) => {
                     // N key - cycle through notification presets (All off -> Mode only -> Mode + Behavior -> All on)
-                    if (event.key.toLowerCase() === 'n' && !event.target.matches('input, select, textarea')) {
+                    if (event.ctrlKey || event.metaKey || event.altKey) return;
+                    if (event.key.toLowerCase() === 'n' && !event.target.matches('input, select, textarea, [contenteditable]:not([contenteditable="false"])')) {
                         const preset = toast.cycleNotificationPreset();
                         const presetName = toast.getNotificationPresetName();
                         // Show notification about preset change (always show, even if notifications are off)

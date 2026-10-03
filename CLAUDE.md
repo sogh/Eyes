@@ -31,6 +31,7 @@ User controls
 - Q/W: Scale up/down
 - E/R: Gap wider/closer
 - Arrow keys: Move position (up/down/left/right)
+- Backspace/Delete: Reset active set position, scale and gap (recover off-screen eyes)
 - Z: Toggle Spider Mode
 - T: Toggle tears (drips)
 - D: Toggle director (auto behavior orchestration)
