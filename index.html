@@ -645,6 +645,7 @@
                 this.startTime = startTime;
                 this.scheduledActions = [];   // Array of timeout IDs
                 this.interactionInstances = []; // Related script instances
+                this.interactionTargets = [];   // Eye set indices already claimed by this script's interactions
                 this.isRunning = false;
                 this.isInteraction = false;    // Flag to prevent recursive interactions
                 this.onComplete = null;        // Callback when script finishes
@@ -902,6 +903,43 @@
         // SCRIPT EXECUTION ENGINE
         // ============================================================
 
+        // Notification hook for UI modules (toast). No-op until js/ui/toast.js has loaded.
+        // kind is a ToastManager method name (modeChange, behaviorChange, scriptExecution, ...),
+        // so the toast's notification-preset filtering still applies.
+        function notify(kind, msg) {
+            window.toast?.[kind]?.(msg);
+        }
+
+        // Resolve which eye set an interaction should target. Falls back to another visible set
+        // when the hardcoded targetSet is hidden, is the initiator, or was already used.
+        function resolveInteractionTarget(instance, interaction) {
+            const initiator = instance.setIndex;
+            const used = new Set(instance.interactionTargets);
+            const isCandidate = (i) => i !== initiator && !used.has(i) && eyeSets[i] && eyeSets[i].visible;
+
+            if (isCandidate(interaction.targetSet)) {
+                return interaction.targetSet;
+            }
+
+            // Don't steal sets that other interactions of this script explicitly target
+            const reserved = new Set(
+                (instance.scriptObject.interactions || [])
+                    .filter(other => other !== interaction)
+                    .map(other => other.targetSet)
+                    .filter(isCandidate)
+            );
+
+            for (let i = 0; i < eyeSets.length; i++) {
+                if (isCandidate(i) && !reserved.has(i)) {
+                    console.debug(`Interaction target ${interaction.targetSet} unavailable for "${instance.scriptObject.name}" on eye set ${initiator}; using eye set ${i}`);
+                    return i;
+                }
+            }
+
+            console.debug(`Interaction target ${interaction.targetSet} unavailable for "${instance.scriptObject.name}" on eye set ${initiator}; no other visible set, skipping`);
+            return null;
+        }
+
         // Start executing a script on an eye set
         async function executeScript(setIndex, scriptId, isInteraction = false) {
             
@@ -955,10 +993,19 @@
             if (scriptObject.interactions && !isInteraction) {
                 for (const interaction of scriptObject.interactions) {
                     const interactionTimeoutId = setTimeout(async () => {
+                        if (!instance.isRunning) return;
+                        const targetSet = resolveInteractionTarget(instance, interaction);
+                        if (targetSet === null) return;
+                        instance.interactionTargets.push(targetSet);
+
                         const targetScript = interaction.scriptId || scriptId;
-                        const interactionInstance = await executeScript(interaction.targetSet, targetScript, true);
+                        const interactionInstance = await executeScript(targetSet, targetScript, true);
                         if (interactionInstance) {
                             instance.interactionInstances.push(interactionInstance);
+                            // Parent was stopped while the partner script was loading
+                            if (!instance.isRunning && eyeSets[targetSet].currentScript === interactionInstance) {
+                                stopScript(targetSet);
+                            }
                         }
                     }, interaction.startTime * 1000);
 
@@ -974,11 +1021,14 @@
             instance.scheduledActions.push(completionTimeoutId);
 
             console.log(`Started script "${scriptObject.name}" on eye set ${setIndex}${isInteraction ? ' (interaction)' : ''}`);
+            if (!isInteraction) {
+                notify('scriptExecution', `Started: ${scriptObject.name} on Eyeset ${setIndex}`);
+            }
             return instance;
         }
 
-        // Complete script execution
-        function completeScript(setIndex) {
+        // Complete script execution (stopped = true when interrupted via stopScript)
+        function completeScript(setIndex, stopped = false) {
             const eyeSet = eyeSets[setIndex];
             if (!eyeSet || !eyeSet.currentScript) return;
 
@@ -1002,6 +1052,9 @@
             scriptExecutionState.scriptInstances.delete(setIndex);
 
             console.log(`Completed script "${instance.scriptObject.name}" on eye set ${setIndex}`);
+            if (!instance.isInteraction) {
+                notify('scriptExecution', `${stopped ? 'Stopped' : 'Completed'}: ${instance.scriptObject.name} on Eyeset ${setIndex}`);
+            }
 
             // Restore original position, scale, and gap if they were stored
             if (instance.originalState) {
@@ -1031,7 +1084,19 @@
             const eyeSet = eyeSets[setIndex];
             if (!eyeSet || !eyeSet.currentScript) return;
 
-            completeScript(setIndex);
+            const instance = eyeSet.currentScript;
+            completeScript(setIndex, true);
+
+            // Also stop partner scripts this script launched on other sets, but only if they
+            // are still running there (a set may have since started a different script).
+            // Interaction instances never have their own interactions, so this can't recurse further.
+            if (!instance.isInteraction) {
+                for (const partner of instance.interactionInstances) {
+                    if (eyeSets[partner.setIndex] && eyeSets[partner.setIndex].currentScript === partner) {
+                        stopScript(partner.setIndex);
+                    }
+                }
+            }
         }
 
         // Execute a single action
@@ -1808,6 +1873,13 @@
                 }
             }
 
+            const behaviorNames = {
+                [BehaviorType.AUTONOMOUS]: 'Autonomous',
+                [BehaviorType.TRACKING]: 'Tracking',
+                [BehaviorType.SCRIPTED]: 'Scripted'
+            };
+            notify('behaviorChange', `Eyeset ${setIndex}: ${behaviorNames[behavior] || behavior}`);
+
             debouncedSaveState();
         }
 
@@ -2066,6 +2138,18 @@
             console.log('Director stopped');
         }
 
+        // Toggle the director on/off (D key). Toasts live here rather than in start/stopDirector,
+        // because those are also called by setDirectorMode and test mode, which show their own toasts.
+        function toggleDirector() {
+            if (directorState.enabled) {
+                stopDirector();
+                notify('modeChange', 'Director: Disabled');
+            } else {
+                startDirector(directorState.mode);
+                notify('modeChange', `Director: Enabled (${directorState.mode} mode)`);
+            }
+        }
+
         // Main director evaluation loop
         function evaluateDirector() {
             if (!directorState.enabled) return;
@@ -2093,6 +2177,9 @@
                 scheduleDirectorEvaluation();
                 return;
             }
+
+            // At most one script may start per evaluation (the cooldown applies from then on)
+            let scriptTriggered = false;
 
             // Evaluate each visible eye set
             for (const { set, idx } of visibleSets) {
@@ -2123,8 +2210,11 @@
                         break;
 
                     case 'scripted':
+                        // Cooldown now in effect: leave this set's behavior unchanged
+                        if (scriptTriggered) break;
                         triggerDirectorScript(idx, visibleSets);
                         directorState.lastScriptTime = now;
+                        scriptTriggered = true;
                         break;
                 }
             }
@@ -2228,6 +2318,7 @@
 
             if (wasEnabled) {
                 startDirector(mode);
+                notify('modeChange', `Director Mode: ${mode}`);
             }
 
             console.log(`Director mode changed to: ${mode}`);
@@ -2772,6 +2863,8 @@
                     toggleEyeSet(0);
                 }
             }
+
+            notify('modeChange', `Spider Mode: ${isSpiderModeActive ? 'ON' : 'OFF'}`);
         }
 
         // Cancel any in-flight eyelid (ry) animation and pending blink reopen for an eye set
@@ -3749,79 +3842,8 @@
                     }
                 });
 
-                // Add toast notifications to mode changes
-                const originalToggleSpiderMode = toggleSpiderMode;
-                window.toggleSpiderMode = function() {
-                    originalToggleSpiderMode();
-                    // Update window reference and show toast
-                    window.isSpiderModeActive = isSpiderModeActive;
-                    setTimeout(() => {
-                        if (isSpiderModeActive) {
-                            toast.modeChange('Spider Mode: ON');
-                        } else {
-                            toast.modeChange('Spider Mode: OFF');
-                        }
-                    }, 10);
-                };
-
-                window.toggleDirector = () => {
-                    if (directorState.enabled) {
-                        stopDirector();
-                        toast.modeChange('Director: Disabled');
-                    } else {
-                        startDirector(directorState.mode);
-                        toast.modeChange(`Director: Enabled (${directorState.mode} mode)`);
-                    }
-                };
-
-                const originalSetDirectorMode = setDirectorMode;
-                window.setDirectorMode = function(mode) {
-                    originalSetDirectorMode(mode);
-                    setTimeout(() => {
-                        if (window.directorState && window.directorState.enabled) {
-                            toast.modeChange(`Director Mode: ${mode}`);
-                        }
-                    }, 10);
-                };
-
-                const originalSetEyeBehavior = setEyeBehavior;
-                window.setEyeBehavior = function(setIndex, behavior) {
-                    originalSetEyeBehavior(setIndex, behavior);
-                    const behaviorNames = {
-                        'autonomous': 'Autonomous',
-                        'tracking': 'Tracking',
-                        'scripted': 'Scripted'
-                    };
-                    toast.behaviorChange(`Eyeset ${setIndex}: ${behaviorNames[behavior] || behavior}`);
-                };
-
-                const originalExecuteScript = executeScript;
-                window.executeScript = async function(setIndex, scriptId, isInteraction) {
-                    const instance = await originalExecuteScript(setIndex, scriptId, isInteraction);
-                    if (instance && !isInteraction) {
-                        const scriptExecutionState = window.scriptExecutionState;
-                        if (scriptExecutionState) {
-                            const script = scriptExecutionState.loadedScripts.get(scriptId);
-                            if (script) {
-                                toast.scriptExecution(`Started: ${script.name} on Eyeset ${setIndex}`);
-                            }
-                        }
-                    }
-                    return instance;
-                };
-
-                const originalCompleteScript = completeScript;
-                window.completeScript = function(setIndex) {
-                    const eyeSets = window.eyeSets || [];
-                    const eyeSet = eyeSets[setIndex];
-                    if (eyeSet && eyeSet.currentScript) {
-                        const scriptName = eyeSet.currentScript.scriptObject.name;
-                        originalCompleteScript(setIndex);
-                        toast.scriptExecution(`Completed: ${scriptName} on Eyeset ${setIndex}`);
-                    } else {
-                        originalCompleteScript(setIndex);
-                    }
-                };
+                // Toasts for mode/behavior/script changes are emitted via notify() from inside
+                // the real functions (toggleSpiderMode, setEyeBehavior, toggleDirector, etc.)
 
                 // Add keyboard shortcut to cycle notification presets
                 document.addEventListener('keydown', (event) => {
@@ -3838,9 +3860,6 @@
                     }
                 });
 
-                // Override existing keyboard handlers to use new functions
-                const keydownHandler = document.querySelector('script').onkeydown || null;
-                
                 // Update instructions to include new shortcuts
                 const instructions = document.getElementById('instructions');
                 if (instructions) {
@@ -3871,7 +3890,10 @@
         window.scriptExecutionState = scriptExecutionState;
         window.directorState = directorState;
         window.BehaviorType = BehaviorType;
-        window.isSpiderModeActive = isSpiderModeActive;
+        window.toggleDirector = toggleDirector;
+        // Live accessors for let-bound state read by UI modules (a plain assignment would be a stale snapshot)
+        Object.defineProperty(window, 'isSpiderModeActive', { get: () => isSpiderModeActive, configurable: true });
+        Object.defineProperty(window, 'activeSetIndex', { get: () => activeSetIndex, configurable: true });
         window.testModeActive = false; // Will be set by test mode
         window.stopScript = stopScript;
         window.stopEyeSetAnimations = stopEyeSetAnimations;
